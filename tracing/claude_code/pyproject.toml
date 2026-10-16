@@ -1,6 +1,6 @@
 [project]
 name = "claude-code-tracing"
-version = "1.0.3"
+version = "1.0.4+bm.1"
 requires-python = ">=3.9"
 dependencies = []
 
