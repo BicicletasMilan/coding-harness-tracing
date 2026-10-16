@@ -643,22 +643,46 @@ def _inject_openinference_project_resource_attr(span_dict: dict, project_name: s
     )
 
 
-def _post_otlp(url: str, body: bytes, headers: dict, label: str) -> bool:
-    """POST an encoded OTLP payload, logging failures. Returns True on 2xx."""
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+DEFAULT_SEND_TIMEOUT_S = 60.0
+
+
+def _send_timeout() -> float:
+    """Seconds to wait for the backend, from ARIZE_SEND_TIMEOUT (default 60)."""
+    raw = os.environ.get("ARIZE_SEND_TIMEOUT", "")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
-    except urllib.error.HTTPError as e:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SEND_TIMEOUT_S
+    return value if value > 0 else DEFAULT_SEND_TIMEOUT_S
+
+
+def _post_otlp(url: str, body: bytes, headers: dict, label: str) -> bool:
+    """POST an encoded OTLP payload, logging failures. Returns True on 2xx.
+
+    A whole turn goes out as one payload at Stop, so a slow backend or a
+    dropped connection loses the turn. Transport errors get one retry; an HTTP
+    error is the backend's answer and is final.
+    """
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    timeout = _send_timeout()
+    for attempt in (1, 2):
         try:
-            detail = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = ""
-        error(f"{label} send failed: HTTP {e.code}: {detail or e.reason}")
-        return False
-    except Exception as e:
-        error(f"{label} send failed: {e}")
-        return False
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            error(f"{label} send failed: HTTP {e.code}: {detail or e.reason}")
+            return False
+        except Exception as e:
+            if attempt == 1:
+                log(f"{label} send retry after: {e}")
+                continue
+            error(f"{label} send failed: {e}")
+            return False
+    return False
 
 
 def _extract_span_name(span_dict: dict) -> str:

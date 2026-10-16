@@ -1167,6 +1167,63 @@ class TestSendSpan:
 
         assert send_span(self._SAMPLE_SPAN) is False
 
+    _PHOENIX = {"target": "phoenix", "endpoint": "http://phoenix:6006", "api_key": "", "project_name": "default"}
+
+    @staticmethod
+    def _ok_response():
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.__enter__ = mock.Mock(return_value=resp)
+        resp.__exit__ = mock.Mock(return_value=False)
+        return resp
+
+    @mock.patch("core.common.resolve_backend")
+    @mock.patch("core.common.urllib.request.urlopen")
+    def test_transport_error_is_retried_once(self, mock_urlopen, mock_resolve, monkeypatch):
+        monkeypatch.delenv("ARIZE_DRY_RUN", raising=False)
+        monkeypatch.delenv("ARIZE_SEND_TIMEOUT", raising=False)
+        mock_resolve.return_value = self._PHOENIX
+        mock_urlopen.side_effect = [TimeoutError("timed out"), self._ok_response()]
+
+        assert send_span(self._SAMPLE_SPAN) is True
+        assert mock_urlopen.call_count == 2
+        assert [call.kwargs["timeout"] for call in mock_urlopen.call_args_list] == [60.0, 60.0]
+
+    @mock.patch("core.common.resolve_backend")
+    @mock.patch("core.common.urllib.request.urlopen")
+    def test_transport_error_twice_gives_up(self, mock_urlopen, mock_resolve, monkeypatch):
+        monkeypatch.delenv("ARIZE_DRY_RUN", raising=False)
+        mock_resolve.return_value = self._PHOENIX
+        mock_urlopen.side_effect = OSError("connection reset")
+
+        assert send_span(self._SAMPLE_SPAN) is False
+        assert mock_urlopen.call_count == 2
+
+    @mock.patch("core.common.resolve_backend")
+    @mock.patch("core.common.urllib.request.urlopen")
+    def test_http_error_is_not_retried(self, mock_urlopen, mock_resolve, monkeypatch):
+        monkeypatch.delenv("ARIZE_DRY_RUN", raising=False)
+        mock_resolve.return_value = self._PHOENIX
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "http://phoenix:6006/v1/traces", 401, "Unauthorized", {}, io.BytesIO(b"")
+        )
+
+        assert send_span(self._SAMPLE_SPAN) is False
+        assert mock_urlopen.call_count == 1
+
+    @mock.patch("core.common.resolve_backend")
+    @mock.patch("core.common.urllib.request.urlopen")
+    def test_send_timeout_comes_from_env(self, mock_urlopen, mock_resolve, monkeypatch):
+        monkeypatch.delenv("ARIZE_DRY_RUN", raising=False)
+        mock_resolve.return_value = self._PHOENIX
+        mock_urlopen.return_value = self._ok_response()
+
+        monkeypatch.setenv("ARIZE_SEND_TIMEOUT", "5")
+        assert send_span(self._SAMPLE_SPAN) is True
+        monkeypatch.setenv("ARIZE_SEND_TIMEOUT", "not-a-number")
+        assert send_span(self._SAMPLE_SPAN) is True
+        assert [call.kwargs["timeout"] for call in mock_urlopen.call_args_list] == [5.0, 60.0]
+
     @mock.patch("core.common.resolve_backend")
     @mock.patch("core.common.urllib.request.urlopen")
     def test_phoenix_http_error_logs_response_body(self, mock_urlopen, mock_resolve, capsys, monkeypatch):
