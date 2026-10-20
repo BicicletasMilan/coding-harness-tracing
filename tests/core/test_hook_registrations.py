@@ -323,6 +323,40 @@ class TestRunHookScript:
         assert migrated.returncode == 0, migrated.stderr
         assert "from hooks.handlers import stop" in launcher.read_text()
 
+    def test_run_hook_ignores_stdlib_shadows_in_cwd(self, tmp_path):
+        """A session directory with a folder named like a stdlib module (Odoo's
+        addons/calendar) must not shadow it when the hook imports its handlers."""
+        python312 = _find_base_python312()
+        if python312 is None:
+            pytest.skip("No base Python 3.12 available outside the active venv")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "python3").symlink_to(python312)
+        session_dir = tmp_path / "addons"
+        (session_dir / "calendar").mkdir(parents=True)
+        (session_dir / "calendar" / "__init__.py").write_text("import odoo\n")
+        plugin_root = REPO_ROOT / "tracing" / "claude_code"
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "PIP_NO_INDEX": "1",
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"),
+        }
+
+        result = subprocess.run(
+            [str(plugin_root / "scripts" / "run-hook"), "arize-hook-stop"],
+            input="{}",
+            text=True,
+            capture_output=True,
+            env=env,
+            cwd=session_dir,
+            timeout=30,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Traceback" not in result.stderr
+
 
 # --- No bash/jq/curl references in docs ---
 

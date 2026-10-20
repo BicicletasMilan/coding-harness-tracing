@@ -83,6 +83,11 @@ bootstrap() {
     # No code reachable from a hook may import `tracing.*` or any third-party
     # package: it would resolve on the pip-installed path but break on the
     # plugin path only, where tests do not exercise it.
+    #
+    # `python -c` puts the current directory first on sys.path, and hooks run
+    # in the session's directory.  A folder there named like a stdlib module
+    # (Odoo's addons/calendar, mail, web...) would shadow it, so the launchers
+    # drop it before importing anything.
     if [ -x "$VENV_DIR/bin/python" ]; then VENV_PYTHON="$VENV_DIR/bin/python"
     elif [ -x "$VENV_DIR/Scripts/python.exe" ]; then VENV_PYTHON="$VENV_DIR/Scripts/python.exe"
     else
@@ -104,7 +109,7 @@ bootstrap() {
         function_name=${spec#*:}
         launcher="$LAUNCHER_DIR/arize-hook-$suffix"
         printf '%s\n' '#!/bin/sh' \
-            "PYTHONPATH=\"\$CLAUDE_PLUGIN_ROOT\${PYTHONPATH:+:\$PYTHONPATH}\" exec \"$VENV_PYTHON\" -c 'from hooks.handlers import $function_name; $function_name()'" \
+            "PYTHONPATH=\"\$CLAUDE_PLUGIN_ROOT\${PYTHONPATH:+:\$PYTHONPATH}\" exec \"$VENV_PYTHON\" -c 'import sys; sys.path[:] = [p for p in sys.path if p not in (\"\", \".\")]; from hooks.handlers import $function_name; $function_name()'" \
             > "$launcher"
         chmod +x "$launcher"
     done
