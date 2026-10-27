@@ -32,6 +32,7 @@ from .adapter import (
     gc_stale_state_files,
     resolve_session,
     resolve_transcript_path,
+    session_vcs_attributes,
 )
 from .span_renderer import render_event_graph
 from .tool_buffer import ToolBuffer, ToolObservation
@@ -1027,6 +1028,7 @@ def _handle_stop(input_json: dict) -> None:
             }
             if user_id:
                 root_attrs["user.id"] = user_id
+            root_attrs.update(session_vcs_attributes(state))
             expansion_type = state.get("pending_expansion_type") or ""
             command_name = state.get("pending_command_name") or ""
             command_args = state.get("pending_command_args") or ""
@@ -1093,6 +1095,7 @@ def _handle_stop(input_json: dict) -> None:
     }
     if user_id:
         attrs["user.id"] = user_id
+    attrs.update(session_vcs_attributes(state))
 
     # Attach command metadata from UserPromptExpansion if present
     expansion_type = state.get("pending_expansion_type") or ""

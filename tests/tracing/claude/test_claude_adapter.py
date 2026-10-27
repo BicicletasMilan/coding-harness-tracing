@@ -198,6 +198,99 @@ class TestEnsureSessionInitialized:
         assert sm.get("trace_count") == "0"
         assert sm.get("tool_count") == "0"
 
+    def test_vcs_attrs_cached_from_cwd(self, claude_state_dir, disable_env_vars, tmp_path):
+        """The cwd's git revision is stored once, at session start."""
+        repo = _git_repo(tmp_path / "repo")
+        sm = self._make_state(claude_state_dir, "vcs")
+        adapter.ensure_session_initialized(sm, {"session_id": "sid-vcs", "cwd": str(repo)})
+        assert adapter.session_vcs_attributes(sm)["vcs.ref.head.revision"] == _head(repo)
+
+    def test_vcs_attrs_empty_outside_git(self, claude_state_dir, disable_env_vars, tmp_path):
+        sm = self._make_state(claude_state_dir, "no-vcs")
+        adapter.ensure_session_initialized(sm, {"session_id": "sid-no-vcs", "cwd": str(tmp_path)})
+        assert sm.get("vcs_attrs") == "{}"
+        assert adapter.session_vcs_attributes(sm) == {}
+
+
+# ── vcs_attributes tests ─────────────────────────────────────────────────────
+
+
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_repo(path):
+    """A git repo on branch v20 with one commit holding CLAUDE.md and README.md."""
+    path.mkdir(parents=True)
+    _git(path, "init", "-q", "-b", "v20")
+    (path / "CLAUDE.md").write_text("rules\n")
+    (path / "README.md").write_text("readme\n")
+    (path / "sub").mkdir()
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "init")
+    return path
+
+
+def _head(repo):
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+class TestVcsAttributes:
+    def test_clean_checkout(self, tmp_path):
+        repo = _git_repo(tmp_path / "repo")
+        assert adapter.vcs_attributes(str(repo)) == {
+            "vcs.ref.head.revision": _head(repo),
+            "vcs.ref.head.name": "v20",
+            "harness.dirty": False,
+        }
+
+    def test_dirty_only_for_harness_paths(self, tmp_path):
+        """Edits outside HARNESS_PATHS don't count; paths resolve from the top, not the cwd."""
+        repo = _git_repo(tmp_path / "repo")
+        (repo / "README.md").write_text("changed\n")
+        assert adapter.vcs_attributes(str(repo / "sub"))["harness.dirty"] is False
+        (repo / ".claude").mkdir()
+        (repo / ".claude" / "settings.json").write_text("{}\n")
+        assert adapter.vcs_attributes(str(repo / "sub"))["harness.dirty"] is True
+
+    def test_detached_head_has_no_branch(self, tmp_path):
+        repo = _git_repo(tmp_path / "repo")
+        _git(repo, "checkout", "-q", "--detach")
+        attrs = adapter.vcs_attributes(str(repo))
+        assert attrs["vcs.ref.head.revision"] == _head(repo)
+        assert "vcs.ref.head.name" not in attrs
+
+    def test_outside_git_is_empty(self, tmp_path):
+        assert adapter.vcs_attributes(str(tmp_path)) == {}
+
+    def test_git_missing_is_empty(self, tmp_path, monkeypatch):
+        def missing(*args, **kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(adapter.subprocess, "run", missing)
+        assert adapter.vcs_attributes(str(tmp_path)) == {}
+
+    def test_git_hanging_is_empty(self, tmp_path, monkeypatch):
+        def hang(*args, **kwargs):
+            raise subprocess.TimeoutExpired("git", adapter.GIT_TIMEOUT_S)
+
+        monkeypatch.setattr(adapter.subprocess, "run", hang)
+        assert adapter.vcs_attributes(str(tmp_path)) == {}
+
+    @pytest.mark.parametrize("raw", [None, "", "not json", "[1, 2]"])
+    def test_unreadable_cache_is_empty(self, tmp_path, raw):
+        sm = StateManager(state_dir=tmp_path, state_file=tmp_path / "s.json", lock_path=tmp_path / ".lock")
+        sm.init_state()
+        if raw is not None:
+            sm.set("vcs_attrs", raw)
+        assert adapter.session_vcs_attributes(sm) == {}
+
 
 # ── gc_stale_state_files tests ───────────────────────────────────────────────
 

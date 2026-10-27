@@ -4,6 +4,7 @@
 Replaces claude-code-tracing/hooks/common.sh (107 lines). Owns Claude-specific
 session logic; individual hook events are handled by handlers.py.
 """
+import json
 import os
 import platform
 import subprocess
@@ -18,6 +19,10 @@ _HARNESS = HARNESSES["claude-code"]
 SERVICE_NAME = _HARNESS["service_name"]  # "claude-code"
 SCOPE_NAME = _HARNESS["scope_name"]  # "arize-claude-plugin"
 STATE_DIR = STATE_BASE_DIR / _HARNESS["state_subdir"]  # ~/.arize/harness/state/claude-code
+
+# Paths whose uncommitted changes make the session's harness differ from its commit.
+HARNESS_PATHS = (".claude", "CLAUDE.md", "openspec", "Makefile")
+GIT_TIMEOUT_S = 2
 
 # Route hook stderr to a per-harness log file unless the user already set one.
 os.environ.setdefault("ARIZE_LOG_FILE", str(_HARNESS["default_log_file"]))
@@ -123,6 +128,7 @@ def ensure_session_initialized(state: StateManager, input_json: dict) -> None:
     - trace_count: "0"
     - tool_count: "0"
     - user_id: from env.get_user_id(SERVICE_NAME), then input_json["user_id"], then ""
+    - vcs_attrs: JSON of vcs_attributes() for the session's cwd, "{}" when git fails
     """
     # Skip if already initialized
     existing = state.get("session_id")
@@ -155,7 +161,53 @@ def ensure_session_initialized(state: StateManager, input_json: dict) -> None:
         user_id = input_json.get("user_id", "")
     state.set("user_id", user_id)
 
+    state.set("vcs_attrs", json.dumps(vcs_attributes(input_json.get("cwd") or os.getcwd())))
+
     log(f"Session initialized: {session_id}")
+
+
+def _git(cwd: str, *args: str) -> Optional[str]:
+    """Run git in `cwd`; its stripped stdout, or None when git is missing, fails or hangs."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def vcs_attributes(cwd: str) -> dict:
+    """OpenTelemetry vcs.* attributes of the git checkout at `cwd`; {} outside one.
+
+    - vcs.ref.head.revision: the commit HEAD points to
+    - vcs.ref.head.name: the branch, left out on a detached HEAD
+    - harness.dirty: whether HARNESS_PATHS have uncommitted changes
+    """
+    revision = _git(cwd, "rev-parse", "HEAD")
+    if not revision:
+        return {}
+    attrs: dict = {"vcs.ref.head.revision": revision}
+    branch = _git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+    if branch:
+        attrs["vcs.ref.head.name"] = branch
+    status = _git(cwd, "status", "--porcelain", "--", *(f":(top){path}" for path in HARNESS_PATHS))
+    if status is not None:
+        attrs["harness.dirty"] = bool(status)
+    return attrs
+
+
+def session_vcs_attributes(state: StateManager) -> dict:
+    """The vcs.* attributes cached at session start; {} when absent or unreadable."""
+    try:
+        attrs = json.loads(state.get("vcs_attrs") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return attrs if isinstance(attrs, dict) else {}
 
 
 def _is_pid_alive(pid: int) -> bool:

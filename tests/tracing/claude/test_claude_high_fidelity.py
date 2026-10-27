@@ -217,6 +217,10 @@ def test_real_v2_transcript_is_exported_once_as_correlated_tree(tmp_path: Path):
     state.set("trace_count", "1")
     state.set("trace_start_line", "0")
     state.set("project_name", "synthetic-project")
+    state.set(
+        "vcs_attrs",
+        json.dumps({"vcs.ref.head.revision": "c0ffee", "vcs.ref.head.name": "v20", "harness.dirty": True}),
+    )
     sent = []
 
     def send_success(payload):
@@ -268,6 +272,10 @@ def test_real_v2_transcript_is_exported_once_as_correlated_tree(tmp_path: Path):
     assert spans[4]["parentSpanId"] == spans[3]["spanId"]
     assert _attrs(spans[0])["openinference.span.kind"] == "CHAIN"
     assert "llm.token_count.total" not in _attrs(spans[0])
+    assert _attrs(spans[0])["vcs.ref.head.revision"] == "c0ffee"
+    assert _attrs(spans[0])["vcs.ref.head.name"] == "v20"
+    assert _attrs(spans[0])["harness.dirty"] is True
+    assert "vcs.ref.head.revision" not in _attrs(spans[1])
     assert _attrs(spans[2])["output.value"] == "hook read output"
     assert _attrs(spans[2])["tool.call.id"] == "tool-read-1"
     assert ToolBuffer(state).all() == []

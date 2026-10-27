@@ -383,6 +383,23 @@ class TestStop:
         span = captured_spans[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
         attrs = {a["key"]: a["value"] for a in span["attributes"]}
         assert "I found the issue." in attrs["output.value"]["stringValue"]
+        assert "vcs.ref.head.revision" not in attrs
+
+    def test_legacy_turn_carries_vcs_attrs(self, mock_resolve, state, captured_spans, transcript_file):
+        state.set("current_trace_id", "t" * 32)
+        state.set("current_trace_span_id", "s" * 16)
+        state.set("current_trace_start_time", "1000")
+        state.set("current_trace_prompt", "fix the bug")
+        state.set("trace_start_line", "0")
+        state.set("vcs_attrs", json.dumps({"vcs.ref.head.revision": "c0ffee", "harness.dirty": False}))
+        with mock.patch(
+            "tracing.claude_code.hooks.handlers.resolve_transcript_path", return_value=Path(transcript_file)
+        ):
+            _handle_stop({})
+        span = captured_spans[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {a["key"]: a["value"] for a in span["attributes"]}
+        assert attrs["vcs.ref.head.revision"] == {"stringValue": "c0ffee"}
+        assert attrs["harness.dirty"] == {"boolValue": False}
 
     def test_stop_cleanup_does_not_erase_a_concurrent_newer_turn(self, mock_resolve, state, transcript_file):
         state.set("current_trace_id", "o" * 32)
