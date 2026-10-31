@@ -1,24 +1,33 @@
 """High-fidelity Claude hook integration contract."""
 
+import itertools
 import json
+import os
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
-from core.common import StateManager
+from core.common import StateManager, get_timestamp_ms
 from core.event_model import EventGraph, EventStatus, ToolEvent, TurnEvent
 from tracing.claude_code.hooks.handlers import (
     _buffer_subagent,
+    _DEFERRED_STOP_KEY,
     _cleanup_pending_subagents,
     _handle_post_tool_use,
     _handle_post_tool_use_failure,
     _handle_pre_tool_use,
+    _handle_session_end,
     _handle_stop,
     _handle_subagent_start,
     _handle_subagent_stop,
+    _handle_user_prompt_submit,
     _merge_pending_subagents,
     _merge_tool_observations,
     _pending_subagents,
+    deferred_stop,
 )
 from tracing.claude_code.hooks.tool_buffer import ToolBuffer, ToolObservation
 from tracing.claude_code.hooks.transcript import parse_claude_transcript
@@ -655,3 +664,227 @@ def test_failed_tool_hook_is_correlated_and_marks_tool_span_error(tmp_path: Path
     assert tool["status"]["code"] == 2
     assert _attrs(tool)["error.message"] == "synthetic read failure"
     assert ToolBuffer(state).all() == []
+
+
+FIXTURE_LINES = FIXTURE.read_text(encoding="utf-8").splitlines(keepends=True)
+FINAL_STOP = {"session_id": "session-main-1", "hook_event_name": "Stop", "last_assistant_message": "SYNTHETIC_TOOL_OK"}
+STOPPED_AT_MS = 1767268805000  # after every record of the fixture
+WORKER_INPUT = dict(FINAL_STOP, arize_deferred_stop=True, arize_stopped_at_ms=STOPPED_AT_MS)
+
+
+def _open_turn(tmp_path: Path, lines: "list[str]") -> "tuple[StateManager, Path]":
+    """A session whose turn 1 is open over a transcript holding *lines*."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("".join(lines), encoding="utf-8")
+    state = StateManager(tmp_path, state_file=tmp_path / "state.json", lock_path=tmp_path / "state.lock")
+    state.init_state()
+    for key, value in {
+        "session_id": "session-main-1",
+        "current_trace_id": "a" * 32,
+        "current_trace_span_id": "b" * 16,
+        "current_trace_start_time": "1767268800000",
+        "current_trace_prompt": "synthetic prompt",
+        "trace_count": "1",
+        "trace_start_line": "0",
+    }.items():
+        state.set(key, value)
+    return state, transcript
+
+
+def _hooks(state: StateManager, transcript: Path, *, sleep=None, popen=None, stdin=None, monotonic=None):
+    """Patch the session, transcript, sender, clock, worker spawner and stdin of the handlers."""
+    sent, sleep_mock, popen_mock = [], mock.Mock(side_effect=sleep), popen or mock.Mock()
+    patches = {
+        "resolve_session": {"return_value": state},
+        "resolve_transcript_path": {"return_value": transcript},
+        "ensure_session_initialized": {},
+        "send_span": {"side_effect": lambda payload: sent.append(payload) or True},
+        "time.sleep": {"new": sleep_mock},
+        "subprocess.Popen": {"new": popen_mock},
+        "_read_stdin": {"return_value": stdin or {}},
+        "gc_stale_state_files": {},
+    }
+    if monotonic is not None:
+        patches["time.monotonic"] = {"side_effect": monotonic}
+    stack = ExitStack()
+    for target, kwargs in patches.items():
+        stack.enter_context(mock.patch(f"tracing.claude_code.hooks.handlers.{target}", **kwargs))
+    return stack, sent, sleep_mock, popen_mock
+
+
+def _defer_marker_until(state: StateManager, deadline_ms: int, then=None):
+    """Set a deferred-Stop deadline; return a sleep side effect that runs *then* and finishes the worker."""
+    state.set(_DEFERRED_STOP_KEY, str(deadline_ms))
+
+    def worker_finishes(_seconds):
+        if then:
+            then()
+        state.delete("current_trace_id")
+        state.delete(_DEFERRED_STOP_KEY)
+
+    return worker_finishes
+
+
+def test_stop_exports_at_once_when_the_final_record_is_written(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES)
+    stack, sent, sleep, popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    popen.assert_not_called()
+    sleep.assert_not_called()
+    assert [span["name"] for span in _spans(sent[0])][-1] == "LLM call 3: qwen3-coder-next"
+    assert state.get("current_trace_id") is None
+
+
+def test_stop_hands_the_turn_to_a_detached_worker_when_the_final_record_is_missing(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    stack, sent, sleep, popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    assert sent == []
+    sleep.assert_not_called()
+    assert state.get("current_trace_id") == "a" * 32
+    assert int(state.get(_DEFERRED_STOP_KEY)) > get_timestamp_ms()
+    (argv,), kwargs = popen.call_args
+    assert argv[0] == sys.executable
+    assert kwargs["stdout"] is subprocess.DEVNULL and kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs.get("start_new_session") or kwargs.get("creationflags")
+    payload = json.loads(popen.return_value.stdin.write.call_args.args[0])
+    assert payload["arize_deferred_stop"] is True
+    assert isinstance(payload["arize_stopped_at_ms"], int)
+    popen.return_value.stdin.close.assert_called_once()
+
+
+def test_worker_command_imports_its_entry_point(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    stack, _sent, _sleep, popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+    (argv,), _kwargs = popen.call_args
+
+    # The hook launchers put the plugin root on PYTHONPATH; here the repo root plays that part.
+    repo_root = str(Path(__file__).resolve().parents[3])
+    result = subprocess.run(
+        argv, input=b"{}", capture_output=True, cwd=tmp_path, timeout=60, env={**os.environ, "PYTHONPATH": repo_root}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert b"deferred stop failed" not in result.stderr
+
+
+def test_worker_exports_the_turn_once_the_final_record_lands(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set(_DEFERRED_STOP_KEY, str(get_timestamp_ms() + 60_000))
+
+    def claude_code_writes_the_final_record(_seconds):
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(FIXTURE_LINES[-1])
+
+    stack, sent, sleep, popen = _hooks(state, transcript, sleep=claude_code_writes_the_final_record, stdin=WORKER_INPUT)
+    with stack:
+        deferred_stop()
+
+    assert sleep.call_count == 1
+    popen.assert_not_called()
+    spans = _spans(sent[0])
+    assert spans[-1]["name"] == "LLM call 3: qwen3-coder-next"
+    root = next(span for span in spans if not span.get("parentSpanId"))
+    assert int(root["endTimeUnixNano"]) == STOPPED_AT_MS * 1_000_000
+    assert state.get("current_trace_id") is None
+    assert state.get(_DEFERRED_STOP_KEY) is None
+
+
+def test_worker_gives_up_after_the_timeout_and_sends_the_legacy_turn(tmp_path: Path):
+    # A text-only turn whose final record never lands: only the prompt is written.
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:1])
+    state.set(_DEFERRED_STOP_KEY, str(get_timestamp_ms() + 60_000))
+    stack, sent, sleep, _popen = _hooks(state, transcript, stdin=WORKER_INPUT, monotonic=itertools.count(0, 0.25))
+    with stack:
+        deferred_stop()
+
+    assert sleep.call_count == 19  # reads at 0.25 s ticks until the 5 s deadline, sleeping between them
+    span = _spans(sent[0])[0]
+    assert span["name"] == "Turn 1"
+    assert _attrs(span)["openinference.span.kind"] == "LLM"
+    assert int(span["endTimeUnixNano"]) == STOPPED_AT_MS * 1_000_000
+    assert state.get(_DEFERRED_STOP_KEY) is None
+
+
+def test_stop_exports_at_once_when_the_worker_cannot_start(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    stack, sent, _sleep, _popen = _hooks(state, transcript, popen=mock.Mock(side_effect=OSError("no fork")))
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    assert len(sent) == 1
+    assert state.get(_DEFERRED_STOP_KEY) is None
+    assert state.get("current_trace_id") is None
+
+
+def test_repeated_stop_waits_for_the_worker_instead_of_exporting_again(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    worker_finishes = _defer_marker_until(state, get_timestamp_ms() + 60_000)
+    stack, sent, sleep, popen = _hooks(state, transcript, sleep=worker_finishes)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    assert sleep.call_count == 1
+    assert sent == []
+    popen.assert_not_called()
+
+
+def test_next_prompt_waits_for_the_worker_before_the_fail_safe(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES)
+    worker_finishes = _defer_marker_until(state, get_timestamp_ms() + 60_000)
+    stack, sent, sleep, _popen = _hooks(state, transcript, sleep=worker_finishes)
+    with stack:
+        _handle_user_prompt_submit({"session_id": "session-main-1", "prompt": "next prompt"})
+
+    assert sleep.call_count == 1
+    assert sent == []  # the worker exported the turn, so the fail-safe had nothing to close
+    assert state.get("current_trace_id") not in (None, "a" * 32)
+    assert state.get("current_trace_prompt") == "next prompt"
+
+
+def test_next_prompt_ignores_a_worker_past_its_deadline(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES)
+    state.set(_DEFERRED_STOP_KEY, str(get_timestamp_ms() - 1))
+    stack, sent, sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_user_prompt_submit({"session_id": "session-main-1", "prompt": "next prompt"})
+
+    sleep.assert_not_called()
+    assert len(sent) == 1  # the fail-safe closed the turn the worker left open
+
+
+def test_session_end_waits_for_the_worker_before_removing_the_state(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES)
+
+    def state_still_there():
+        assert state.state_file.exists()
+
+    worker_finishes = _defer_marker_until(state, get_timestamp_ms() + 60_000, then=state_still_there)
+    stack, _sent, sleep, _popen = _hooks(state, transcript, sleep=worker_finishes)
+    with stack, mock.patch("tracing.claude_code.hooks.handlers.error"):
+        _handle_session_end({"session_id": "session-main-1"})
+
+    assert sleep.call_count == 1
+    assert not state.state_file.exists()
+
+
+def test_fail_safe_close_neither_waits_nor_defers(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    fail_safe = {
+        "session_id": "session-main-1",
+        "hook_event_name": "UserPromptSubmit",
+        "last_assistant_message": "(Turn closed by fail-safe: Stop hook did not fire)",
+    }
+    stack, sent, sleep, popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(fail_safe)
+
+    sleep.assert_not_called()
+    popen.assert_not_called()
+    assert len(sent) == 1
