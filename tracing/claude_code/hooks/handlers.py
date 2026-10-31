@@ -7,7 +7,10 @@ entry point registered in pyproject.toml [project.scripts].
 
 import json
 import math
+import os
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -365,6 +368,8 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
     """Handle user_prompt_submit: set up a new trace (close orphaned turn first)."""
     state = resolve_session(input_json)
     ensure_session_initialized(state, input_json)
+    # Let a deferred Stop export the previous turn before the fail-safe sees it open.
+    _wait_for_deferred_stop(state)
 
     # Retry a retained turn before starting a new one.  A failed export keeps the
     # old state intact so observations and stable span IDs can be retried later.
@@ -515,6 +520,119 @@ def _scan_transcript_for_usage(
         usage_totals.completion += _usage_int(usage, "output_tokens")
 
     return output, usage_totals, model
+
+
+# Claude Code fires Stop before it appends the turn's final assistant record to
+# the transcript. In an interactive session the record usually lands only after
+# every Stop hook has returned, so no wait inside the hook can see it. Reading at
+# once drops that model call, and a text-only turn is left with no model call at
+# all, so it degrades to the legacy span without model or tokens. Stop therefore
+# hands such a turn to a detached worker that waits for the record and exports
+# the turn; the next prompt, a repeated Stop and SessionEnd wait for that worker
+# through a deadline kept in the session state.
+_FINAL_RECORD_POLL_S = 0.1
+_FINAL_RECORD_TIMEOUT_S = 5.0
+_DEFERRED_STOP_GRACE_S = 5.0
+_DEFERRED_STOP_KEY = "deferred_stop_deadline_ms"
+
+
+def _record_texts(line: bytes) -> "list[str]":
+    """Return the text blocks of an assistant transcript record, or [] for any other line."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return []
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return []
+    content = msg.get("content")
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+    return []
+
+
+def _wait_for_final_record(transcript: Path, start_line: int, final_text: str, timeout_s: float) -> bool:
+    """Poll the transcript until an assistant record after *start_line* ends *final_text*.
+
+    A final message split over several text blocks is written one record per
+    block, so a record matches when the message ends with its text. Returns
+    False when the record is still missing after *timeout_s* (0 checks once),
+    and True when it is there or the transcript cannot be read, since waiting
+    would not help then.
+    """
+    final_text = final_text.strip()
+    deadline = time.monotonic() + timeout_s
+    try:
+        with open(transcript, "rb") as f:
+            for _ in range(start_line):
+                if not f.readline():
+                    break
+            offset = f.tell()
+            while True:
+                f.seek(offset)
+                for line in f:
+                    if any(text.strip() and final_text.endswith(text.strip()) for text in _record_texts(line)):
+                        return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_FINAL_RECORD_POLL_S)
+    except OSError as exc:
+        log(f"Stop: could not poll the transcript for the final record: {exc}")
+        return True
+
+
+def _defer_stop(state, input_json: dict) -> bool:
+    """Start a detached worker that exports this turn once its final record lands.
+
+    Returns False when the worker could not start, so the caller exports now.
+    The worker's stdio is not the hook's, so Claude Code does not wait for it.
+    """
+    stopped_at_ms = get_timestamp_ms()
+    deadline_ms = stopped_at_ms + int((_FINAL_RECORD_TIMEOUT_S + _DEFERRED_STOP_GRACE_S) * 1000)
+    state.set(_DEFERRED_STOP_KEY, str(deadline_ms))
+    payload = json.dumps(dict(input_json, arize_deferred_stop=True, arize_stopped_at_ms=stopped_at_ms))
+    # Same sys.path hygiene as the hook launchers: never import from the cwd.
+    code = (
+        "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; "
+        f"from {__name__} import deferred_stop; deferred_stop()"
+    )
+    if os.name == "nt":
+        detach = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        detach = {"start_new_session": True}
+    try:
+        worker = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **detach,
+        )
+        worker.stdin.write(payload.encode("utf-8"))
+        worker.stdin.close()
+    except (OSError, ValueError) as exc:
+        error(f"Stop: could not start the deferred export, exporting now: {exc}")
+        state.delete(_DEFERRED_STOP_KEY)
+        return False
+    log("Stop: final assistant record not in the transcript yet; deferred the export")
+    return True
+
+
+def _wait_for_deferred_stop(state) -> None:
+    """Block until a deferred Stop worker finishes, or until its deadline passes."""
+    while True:
+        try:
+            deadline_ms = int(state.get(_DEFERRED_STOP_KEY) or "0")
+        except ValueError:
+            return
+        if not deadline_ms:
+            return
+        if get_timestamp_ms() >= deadline_ms:
+            log("deferred Stop export missed its deadline; continuing without it")
+            return
+        time.sleep(_FINAL_RECORD_POLL_S)
 
 
 def _has_stable_model_ids(graph) -> bool:
@@ -956,6 +1074,10 @@ def _periodic_gc(trace_count: str) -> None:
 def _handle_stop(input_json: dict) -> None:
     """Handle Stop: send the LLM span for the completed turn and clean up trace state."""
     state = resolve_session(input_json)
+    deferred = bool(input_json.get("arize_deferred_stop"))
+    if not deferred:
+        # A worker may still be exporting this turn from an earlier Stop.
+        _wait_for_deferred_stop(state)
     session_id = state.get("session_id")
     trace_id = state.get("current_trace_id")
     if session_id is None or trace_id is None:
@@ -977,6 +1099,18 @@ def _handle_stop(input_json: dict) -> None:
     model = ""
 
     transcript = resolve_transcript_path(input_json, session_id)
+    # Only a real Stop carries the final message; the fail-safe close from
+    # UserPromptSubmit has nothing to wait for.
+    if transcript is not None and last_msg and input_json.get("hook_event_name") == "Stop":
+        start_line = int(state.get("trace_start_line") or "0")
+        if deferred:
+            if not _wait_for_final_record(transcript, start_line, last_msg, _FINAL_RECORD_TIMEOUT_S):
+                log(f"Stop: final assistant record not in the transcript after {_FINAL_RECORD_TIMEOUT_S}s")
+        elif not _wait_for_final_record(transcript, start_line, last_msg, 0) and _defer_stop(state, input_json):
+            return
+    stopped_at_ms = input_json.get("arize_stopped_at_ms")
+    if not isinstance(stopped_at_ms, int) or isinstance(stopped_at_ms, bool):
+        stopped_at_ms = get_timestamp_ms()
     if transcript is not None:
         start_line = int(state.get("trace_start_line") or "0")
         scanned_output, usage, scanned_model = _scan_transcript_for_usage(transcript, start_line)
@@ -994,7 +1128,7 @@ def _handle_stop(input_json: dict) -> None:
             turn_id=trace_count,
             sequence=0,
             started_at_ms=int(trace_start_time) if trace_start_time.isdigit() else None,
-            ended_at_ms=get_timestamp_ms(),
+            ended_at_ms=stopped_at_ms,
             status=EventStatus.COMPLETED,
             input=user_prompt,
             output=output,
@@ -1118,7 +1252,7 @@ def _handle_stop(input_json: dict) -> None:
         trace_id,
         "",
         trace_start_time,
-        str(get_timestamp_ms()),
+        str(stopped_at_ms),
         attrs,
         SERVICE_NAME,
         SCOPE_NAME,
@@ -1434,6 +1568,9 @@ def _handle_session_end(input_json: dict) -> None:
     error(f"Session complete: {trace_count} traces, {tool_count} tools")
     error(f"View in Arize/Phoenix: session.id = {session_id}")
 
+    # A deferred Stop still reads this state; let it export the last turn first.
+    _wait_for_deferred_stop(state)
+
     # Clean up state file and lock
     if state.state_file is not None:
         state.state_file.unlink(missing_ok=True)
@@ -1565,6 +1702,20 @@ def stop():
         _handle_stop(input_json)
     except Exception as e:
         error(f"stop hook failed: {e}")
+
+
+def deferred_stop():
+    """Entry point for the detached worker that ``_defer_stop`` starts."""
+    try:
+        input_json = _read_stdin()
+        if not input_json.get("arize_deferred_stop"):
+            return
+        try:
+            _handle_stop(input_json)
+        finally:
+            resolve_session(input_json).delete(_DEFERRED_STOP_KEY)
+    except Exception as e:
+        error(f"deferred stop failed: {e}")
 
 
 def subagent_stop():
