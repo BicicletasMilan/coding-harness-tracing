@@ -371,9 +371,15 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
     # Let a deferred Stop export the previous turn before the fail-safe sees it open.
     _wait_for_deferred_stop(state)
 
+    prompt = input_json.get("prompt", "") or ""
+    prompt_id = input_json.get("prompt_id", "") or ""
+    prev_trace_id = state.get("current_trace_id")
+    if prev_trace_id and _queue_prompt(state, prev_trace_id, prompt_id, prompt):
+        log("UserPromptSubmit: prompt queued behind the running turn")
+        return
+
     # Retry a retained turn before starting a new one.  A failed export keeps the
     # old state intact so observations and stable span IDs can be retried later.
-    prev_trace_id = state.get("current_trace_id")
     if prev_trace_id:
         retry_input = dict(input_json)
         retry_input.setdefault("last_assistant_message", "(Turn closed by fail-safe: Stop hook did not fire)")
@@ -392,10 +398,12 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
     state.set("current_trace_id", generate_trace_id())
     state.set("current_trace_span_id", generate_span_id())
     state.set("current_trace_start_time", str(get_timestamp_ms()))
-    prompt = input_json.get("prompt", "") or ""
     # Store RAW prompt in state; redact only at span build time so the redaction
     # toggle is read once-per-emit instead of being baked into the state file.
     state.set("current_trace_prompt", prompt)
+    state.set("current_trace_prompt_id", prompt_id)
+    # Prompts queued behind a turn that never reached Stop have no turn to join.
+    state.delete(_QUEUED_PROMPTS_KEY)
 
     # Track transcript position
     transcript = input_json.get("transcript_path", "")
@@ -633,6 +641,137 @@ def _wait_for_deferred_stop(state) -> None:
             log("deferred Stop export missed its deadline; continuing without it")
             return
         time.sleep(_FINAL_RECORD_POLL_S)
+
+
+# Claude Code runs UserPromptSubmit as soon as the user submits a prompt, also
+# while a turn is still running; the prompt then waits in a queue and carries the
+# running turn's prompt_id. A turn with tool calls takes queued prompts between
+# calls. Otherwise every queued prompt goes into one new turn after Stop, which
+# gets a Stop of its own but no UserPromptSubmit. A turn interrupted with Esc gets
+# no Stop, and the next prompt carries a new prompt_id: that is the orphan the
+# fail-safe closes. So a prompt with the open turn's prompt_id is only queued, and
+# Stop opens the next turn for the queued prompts the ended turn did not take.
+_QUEUED_PROMPTS_KEY = "queued_prompts"
+# The prompt_id of a turn opened from the queue is unknown until it ends, so any
+# prompt submitted while it runs is taken as queued behind it.
+_QUEUED_TURN_PROMPT_ID = "(queued)"
+
+
+def _decode_queued_prompts(raw: object) -> "list[str]":
+    try:
+        decoded = json.loads(raw) if isinstance(raw, str) and raw else []
+    except ValueError:
+        return []
+    return [item for item in decoded if isinstance(item, str)] if isinstance(decoded, list) else []
+
+
+def _queue_prompt(state, trace_id: str, prompt_id: str, prompt: str) -> bool:
+    """Queue *prompt* behind the open turn when it carries that turn's prompt_id."""
+    if not prompt_id or state.state_file is None:
+        return False
+    try:
+        with state._lock():
+            data = state._read_safe()
+            owner = data.get("current_trace_prompt_id") or ""
+            if data.get("current_trace_id") != trace_id or owner not in (prompt_id, _QUEUED_TURN_PROMPT_ID):
+                return False
+            queued = _decode_queued_prompts(data.get(_QUEUED_PROMPTS_KEY))
+            data[_QUEUED_PROMPTS_KEY] = json.dumps([*queued, prompt])
+            state._write(data)
+        return True
+    except Exception as exc:
+        error(f"Failed to queue prompt: {exc}")
+        return False
+
+
+def _line_prompts(line: bytes) -> "list[str]":
+    """Return the prompts a transcript line gives the turn: user text, or a queued prompt taken mid-turn."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(entry, dict):
+        return []
+    attachment = entry.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+        content = attachment.get("prompt")
+    elif entry.get("type") == "user" and isinstance(entry.get("message"), dict):
+        content = entry["message"].get("content")
+    else:
+        return []
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+    return []
+
+
+def _turn_extent(transcript: Path, start_line: int, final_text: str) -> "tuple[int, set[str]]":
+    """Return the line after the turn's final assistant record and the prompts the turn took.
+
+    Without a final record in the transcript the turn runs to its end.
+    """
+    final_text = final_text.strip()
+    end_line, seen = start_line, set()
+    final: "tuple[int, set[str]] | None" = None
+    try:
+        with open(transcript, "rb") as f:
+            for number, line in enumerate(f):
+                if number < start_line:
+                    continue
+                seen.update(text.strip() for text in _line_prompts(line))
+                end_line = number + 1
+                if final_text and any(
+                    text.strip() and final_text.endswith(text.strip()) for text in _record_texts(line)
+                ):
+                    final = (end_line, set(seen))
+    except OSError as exc:
+        log(f"Stop: could not read the transcript for queued prompts: {exc}")
+        return start_line, set()
+    return final or (end_line, seen)
+
+
+def _start_queued_turn(state, input_json: dict, transcript: "Path | None", start_line: int, ended_at_ms: int) -> None:
+    """Open the turn Claude Code runs next for the queued prompts the ended turn did not take."""
+    if input_json.get("hook_event_name") not in ("Stop", "StopFailure") or not state.get(_QUEUED_PROMPTS_KEY):
+        return
+    if transcript is None:
+        next_line, taken = start_line, set()
+    else:
+        next_line, taken = _turn_extent(transcript, start_line, input_json.get("last_assistant_message", "") or "")
+    if state.state_file is None:
+        return
+    try:
+        with state._lock():
+            data = state._read_safe()
+            pending = [
+                prompt
+                for prompt in _decode_queued_prompts(data.pop(_QUEUED_PROMPTS_KEY, None))
+                if prompt.strip() not in taken
+            ]
+            opened = bool(pending) and not data.get("current_trace_id")
+            if opened:
+                try:
+                    trace_count = int(data.get("trace_count", "0"))
+                except (ValueError, TypeError):
+                    trace_count = 0
+                data.update(
+                    {
+                        "trace_count": str(trace_count + 1),
+                        "current_trace_id": generate_trace_id(),
+                        "current_trace_span_id": generate_span_id(),
+                        "current_trace_start_time": str(ended_at_ms),
+                        "current_trace_prompt": "\n\n".join(pending),
+                        "current_trace_prompt_id": _QUEUED_TURN_PROMPT_ID,
+                        "trace_start_line": str(next_line),
+                    }
+                )
+            state._write(data)
+    except Exception as exc:
+        error(f"Failed to open the turn for queued prompts: {exc}")
+        return
+    if opened:
+        log(f"Stop: opened the next turn for {len(pending)} queued prompt(s)")
 
 
 def _has_stable_model_ids(graph) -> bool:
@@ -1047,6 +1186,7 @@ def _acknowledge_exported_turn(
                 "current_trace_span_id",
                 "current_trace_start_time",
                 "current_trace_prompt",
+                "current_trace_prompt_id",
                 "trace_start_line",
                 "pending_expansion_type",
                 "pending_command_name",
@@ -1089,6 +1229,7 @@ def _handle_stop(input_json: dict) -> None:
     project_name = state.get("project_name") or ""
     trace_count = state.get("trace_count") or "0"
     user_id = state.get("user_id") or ""
+    trace_start_line = int(state.get("trace_start_line") or "0")
 
     # Claude Code v2 ships the assistant's final text directly.  Earlier versions
     # didn't, so we still scan the transcript when last_assistant_message is empty.
@@ -1207,7 +1348,8 @@ def _handle_stop(input_json: dict) -> None:
             if send_span(payload) is False:
                 return
             _remember_async_subagents(state, graph, span_id_overrides, trace_id, matched_subagents)
-            _acknowledge_exported_turn(state, trace_id, matched_observations, matched_subagents)
+            if _acknowledge_exported_turn(state, trace_id, matched_observations, matched_subagents):
+                _start_queued_turn(state, input_json, transcript, trace_start_line, stopped_at_ms)
             _periodic_gc(trace_count)
             return
 
@@ -1262,7 +1404,8 @@ def _handle_stop(input_json: dict) -> None:
 
     # The legacy payload contains only the Turn span. Preserve unmatched durable
     # observations/descriptors rather than acknowledging data that was not sent.
-    _acknowledge_exported_turn(state, trace_id, [], {})
+    if _acknowledge_exported_turn(state, trace_id, [], {}):
+        _start_queued_turn(state, input_json, transcript, trace_start_line, stopped_at_ms)
     _periodic_gc(trace_count)
 
 
@@ -1431,7 +1574,10 @@ def _handle_stop_failure(input_json: dict) -> None:
 
     # The failure payload contains only the Turn span; buffered child snapshots
     # were not exported and must remain available for diagnosis/retry.
-    _acknowledge_exported_turn(state, trace_id, [], {})
+    trace_start_line = int(state.get("trace_start_line") or "0")
+    if _acknowledge_exported_turn(state, trace_id, [], {}):
+        transcript = resolve_transcript_path(input_json, session_id)
+        _start_queued_turn(state, input_json, transcript, trace_start_line, get_timestamp_ms())
 
 
 def _handle_notification(input_json: dict) -> None:
