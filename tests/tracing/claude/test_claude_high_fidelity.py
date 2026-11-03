@@ -15,12 +15,15 @@ from core.event_model import EventGraph, EventStatus, ToolEvent, TurnEvent
 from tracing.claude_code.hooks.handlers import (
     _buffer_subagent,
     _DEFERRED_STOP_KEY,
+    _QUEUED_PROMPTS_KEY,
+    _QUEUED_TURN_PROMPT_ID,
     _cleanup_pending_subagents,
     _handle_post_tool_use,
     _handle_post_tool_use_failure,
     _handle_pre_tool_use,
     _handle_session_end,
     _handle_stop,
+    _handle_stop_failure,
     _handle_subagent_start,
     _handle_subagent_stop,
     _handle_user_prompt_submit,
@@ -888,3 +891,143 @@ def test_fail_safe_close_neither_waits_nor_defers(tmp_path: Path):
     sleep.assert_not_called()
     popen.assert_not_called()
     assert len(sent) == 1
+
+
+def _user_line(text: str) -> str:
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
+
+
+def _queued_command_line(text: str) -> str:
+    return json.dumps({"type": "attachment", "attachment": {"type": "queued_command", "prompt": text}}) + "\n"
+
+
+def _queued(state: StateManager) -> "list[str]":
+    return json.loads(state.get(_QUEUED_PROMPTS_KEY) or "[]")
+
+
+def test_prompt_with_the_running_turns_prompt_id_is_queued_not_closed(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set("current_trace_prompt_id", "prompt-1")
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_user_prompt_submit({"session_id": "session-main-1", "prompt": "di dos", "prompt_id": "prompt-1"})
+
+    assert sent == []
+    assert state.get("current_trace_id") == "a" * 32
+    assert state.get("current_trace_prompt") == "synthetic prompt"
+    assert _queued(state) == ["di dos"]
+
+
+def test_prompt_with_a_new_prompt_id_closes_the_orphan_and_drops_its_queue(tmp_path: Path):
+    # A turn interrupted with Esc gets no Stop; the next prompt carries a new prompt_id.
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set("current_trace_prompt_id", "prompt-1")
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["queued behind the orphan"]))
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_user_prompt_submit({"session_id": "session-main-1", "prompt": "di tres", "prompt_id": "prompt-2"})
+
+    assert len(sent) == 1
+    assert "fail-safe" in _attrs(_spans(sent[0])[0])["output.value"]
+    assert state.get("current_trace_id") not in (None, "a" * 32)
+    assert state.get("current_trace_prompt") == "di tres"
+    assert state.get("current_trace_prompt_id") == "prompt-2"
+    assert _queued(state) == []
+
+
+def test_stop_opens_the_next_turn_for_prompts_queued_after_it(tmp_path: Path):
+    # A text-only turn: Claude Code runs the queued prompts as a new turn after Stop.
+    state, transcript = _open_turn(tmp_path, [*FIXTURE_LINES, _user_line("di dos"), _user_line("di adiós")])
+    state.set("current_trace_prompt_id", "prompt-1")
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["di dos", "di adiós"]))
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    assert [span["name"] for span in _spans(sent[0])][-1] == "LLM call 3: qwen3-coder-next"
+    assert state.get("current_trace_id") not in (None, "a" * 32)
+    assert state.get("current_trace_prompt") == "di dos\n\ndi adiós"
+    assert state.get("current_trace_prompt_id") == _QUEUED_TURN_PROMPT_ID
+    assert state.get("trace_start_line") == str(len(FIXTURE_LINES))
+    assert state.get("trace_count") == "2"
+    assert int(state.get("current_trace_start_time")) <= get_timestamp_ms()
+    assert _queued(state) == []
+
+
+def test_stop_leaves_prompts_taken_mid_turn_in_the_ended_turn(tmp_path: Path):
+    # A turn with tool calls takes queued prompts between calls.
+    lines = [*FIXTURE_LINES[:-1], _queued_command_line("di dos"), FIXTURE_LINES[-1]]
+    state, transcript = _open_turn(tmp_path, lines)
+    state.set("current_trace_prompt_id", "prompt-1")
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["di dos"]))
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(dict(FINAL_STOP))
+
+    assert len(sent) == 1
+    assert state.get("current_trace_id") is None
+    assert _queued(state) == []
+
+
+def test_prompt_submitted_during_a_turn_opened_from_the_queue_is_queued(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set("current_trace_prompt_id", _QUEUED_TURN_PROMPT_ID)
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_user_prompt_submit({"session_id": "session-main-1", "prompt": "di más", "prompt_id": "prompt-9"})
+
+    assert sent == []
+    assert state.get("current_trace_id") == "a" * 32
+    assert _queued(state) == ["di más"]
+
+
+def test_deferred_worker_opens_the_next_turn_after_the_final_record(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set("current_trace_prompt_id", "prompt-1")
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["di dos"]))
+    state.set(_DEFERRED_STOP_KEY, str(get_timestamp_ms() + 60_000))
+
+    def claude_code_ends_the_turn_and_dequeues(_seconds):
+        with open(transcript, "a", encoding="utf-8") as f:
+            f.write(FIXTURE_LINES[-1] + _user_line("di dos"))
+
+    stack, sent, _sleep, _popen = _hooks(
+        state, transcript, sleep=claude_code_ends_the_turn_and_dequeues, stdin=WORKER_INPUT
+    )
+    with stack:
+        deferred_stop()
+
+    assert [span["name"] for span in _spans(sent[0])][-1] == "LLM call 3: qwen3-coder-next"
+    assert state.get("current_trace_prompt") == "di dos"
+    assert state.get("trace_start_line") == str(len(FIXTURE_LINES))
+    assert state.get("current_trace_start_time") == str(STOPPED_AT_MS)
+
+
+def test_failed_turn_opens_the_next_turn_for_its_queue(tmp_path: Path):
+    # Claude Code writes the dequeued prompts after the StopFailure hook.
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES[:-1])
+    state.set("current_trace_prompt_id", "prompt-1")
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["di dos"]))
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop_failure({"session_id": "session-main-1", "hook_event_name": "StopFailure", "error": "overloaded"})
+
+    assert len(sent) == 1
+    assert state.get("current_trace_prompt") == "di dos"
+
+
+def test_fail_safe_close_does_not_open_a_turn_for_the_queue(tmp_path: Path):
+    state, transcript = _open_turn(tmp_path, FIXTURE_LINES)
+    state.set(_QUEUED_PROMPTS_KEY, json.dumps(["di dos"]))
+    fail_safe = {
+        "session_id": "session-main-1",
+        "hook_event_name": "UserPromptSubmit",
+        "last_assistant_message": "(Turn closed by fail-safe: Stop hook did not fire)",
+    }
+    stack, sent, _sleep, _popen = _hooks(state, transcript)
+    with stack:
+        _handle_stop(fail_safe)
+
+    assert len(sent) == 1
+    assert state.get("current_trace_id") is None
+    assert _queued(state) == ["di dos"]
